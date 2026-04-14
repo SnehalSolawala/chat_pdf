@@ -3,8 +3,8 @@
 import streamlit as st
 import os
 import tempfile
-
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.history_aware_retriever import create_history_aware_retriever
+from langchain.chains.retrieval import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import ChatMessageHistory
@@ -19,16 +19,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API Keys ──────────────────────────────────────────────────────────────────
-GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-os.environ["HF_TOKEN"] = st.secrets["HF_TOKEN", ""]
+# ── API Keys (works both locally via .env AND on Streamlit Cloud via st.secrets)
+def get_secret(key: str) -> str:
+    try:
+        return st.secrets[key]          # Streamlit Cloud
+    except Exception:
+        return os.getenv(key, "")       # Local .env
+
+GROQ_API_KEY = get_secret("GROQ_API_KEY")
+os.environ["HF_TOKEN"] = get_secret("HF_TOKEN")
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF Q&A Chatbot", page_icon="📄")
 st.title("📄 Chat with your PDF")
 st.caption("Upload a PDF and ask questions. Answers come strictly from your document.")
 
-# ── Load Embeddings (once) ────────────────────────────────────────────────────
+# ── Load Embeddings once ───────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading embedding model…")
 def load_embeddings():
     return HuggingFaceEmbeddings(
@@ -38,13 +44,13 @@ def load_embeddings():
 
 embeddings = load_embeddings()
 
-# ── Load LLM (once) ───────────────────────────────────────────────────────────
+# ── Load LLM once ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_llm():
     return ChatGroq(
         model_name="llama-3.1-8b-instant",
         groq_api_key=GROQ_API_KEY,
-        temperature=0
+        temperature=0           # 0 = no creativity, strictly factual
     )
 
 llm = load_llm()
@@ -68,7 +74,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
 
     if uploaded_file:
-        # Re-index only if a new file is uploaded
+        # Re-index only when a NEW file is uploaded
         if uploaded_file.name != st.session_state.last_uploaded_file:
             with st.spinner("Reading and indexing your PDF…"):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -79,16 +85,18 @@ with st.sidebar:
                 docs = loader.load()
 
                 splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=5000, chunk_overlap=500
+                    chunk_size=5000,
+                    chunk_overlap=500
                 )
                 splits = splitter.split_documents(docs)
 
                 st.session_state.vectorstore = Chroma.from_documents(
-                    documents=splits, embedding=embeddings
+                    documents=splits,
+                    embedding=embeddings
                 )
                 st.session_state.last_uploaded_file = uploaded_file.name
 
-                # Clear chat history when a new PDF is loaded
+                # Reset chat when new PDF is loaded
                 st.session_state.messages = []
                 st.session_state.store = {}
 
@@ -103,11 +111,10 @@ with st.sidebar:
         st.session_state.store = {}
         st.rerun()
 
-# ── Build RAG Chain ───────────────────────────────────────────────────────────
+# ── RAG Chain Builder ─────────────────────────────────────────────────────────
 def build_chain(vectorstore):
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # Contextualise question using chat history
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "Given the chat history and the latest user question, "
@@ -121,14 +128,14 @@ def build_chain(vectorstore):
         llm, retriever, contextualize_q_prompt
     )
 
-    # Strict context-only QA prompt
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a strict document Q&A assistant. "
-         "Answer ONLY using the context provided below from the user's PDF. "
-         "If the answer is NOT present in the context, respond with exactly: "
+         "Answer ONLY using the context from the user's PDF provided below. "
+         "If the answer is NOT found in the context, respond with exactly: "
          "'⚠️ This information is not available in the uploaded PDF.' "
-         "Never use outside knowledge. Never guess. Keep answers concise.\n\n"
+         "Never use outside knowledge. Never guess or assume. "
+         "Keep answers concise and to the point.\n\n"
          "Context:\n{context}"),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}")
@@ -136,10 +143,9 @@ def build_chain(vectorstore):
 
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-
     return rag_chain
 
-# ── Session History Helper ────────────────────────────────────────────────────
+# ── Session History ───────────────────────────────────────────────────────────
 def get_session_history(session: str) -> BaseChatMessageHistory:
     if session not in st.session_state.store:
         st.session_state.store[session] = ChatMessageHistory()
@@ -151,7 +157,6 @@ SESSION_ID = "user_session"
 if st.session_state.vectorstore is None:
     st.info("👈 Upload a PDF from the sidebar to get started.")
 else:
-    # Render previous messages
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
@@ -159,13 +164,12 @@ else:
     user_input = st.chat_input("Ask a question about your PDF…")
 
     if user_input:
-        # Show user message
         st.session_state.messages.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.write(user_input)
 
-        # Build chain and get answer
         rag_chain = build_chain(st.session_state.vectorstore)
+
         conversational_rag_chain = RunnableWithMessageHistory(
             rag_chain,
             get_session_history,
