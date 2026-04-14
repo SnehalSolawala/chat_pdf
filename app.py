@@ -1,0 +1,186 @@
+## RAG Q&A — User uploads their own PDF and chats with it
+
+import streamlit as st
+import os
+import tempfile
+
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_chroma import Chroma
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_groq import ChatGroq
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── API Keys ──────────────────────────────────────────────────────────────────
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+os.environ["HF_TOKEN"] = st.secrets["HF_TOKEN", ""]
+
+# ── Page Config ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="PDF Q&A Chatbot", page_icon="📄")
+st.title("📄 Chat with your PDF")
+st.caption("Upload a PDF and ask questions. Answers come strictly from your document.")
+
+# ── Load Embeddings (once) ────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading embedding model…")
+def load_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
+
+embeddings = load_embeddings()
+
+# ── Load LLM (once) ───────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def load_llm():
+    return ChatGroq(
+        model_name="llama-3.1-8b-instant",
+        groq_api_key=GROQ_API_KEY,
+        temperature=0
+    )
+
+llm = load_llm()
+
+# ── Session State Init ────────────────────────────────────────────────────────
+if "store" not in st.session_state:
+    st.session_state.store = {}
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+
+if "last_uploaded_file" not in st.session_state:
+    st.session_state.last_uploaded_file = None
+
+# ── Sidebar — PDF Upload ──────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("📂 Upload your PDF")
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+
+    if uploaded_file:
+        # Re-index only if a new file is uploaded
+        if uploaded_file.name != st.session_state.last_uploaded_file:
+            with st.spinner("Reading and indexing your PDF…"):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(uploaded_file.getvalue())
+                    tmp_path = tmp.name
+
+                loader = PyPDFLoader(tmp_path)
+                docs = loader.load()
+
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=5000, chunk_overlap=500
+                )
+                splits = splitter.split_documents(docs)
+
+                st.session_state.vectorstore = Chroma.from_documents(
+                    documents=splits, embedding=embeddings
+                )
+                st.session_state.last_uploaded_file = uploaded_file.name
+
+                # Clear chat history when a new PDF is loaded
+                st.session_state.messages = []
+                st.session_state.store = {}
+
+            st.success(f"✅ **{uploaded_file.name}** indexed!")
+        else:
+            st.success(f"✅ **{uploaded_file.name}** loaded")
+
+    st.divider()
+
+    if st.button("🗑️ Clear Chat History"):
+        st.session_state.messages = []
+        st.session_state.store = {}
+        st.rerun()
+
+# ── Build RAG Chain ───────────────────────────────────────────────────────────
+def build_chain(vectorstore):
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+    # Contextualise question using chat history
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Given the chat history and the latest user question, "
+         "rewrite it as a standalone question. "
+         "Do NOT answer — only rewrite if needed."),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+
+    # Strict context-only QA prompt
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a strict document Q&A assistant. "
+         "Answer ONLY using the context provided below from the user's PDF. "
+         "If the answer is NOT present in the context, respond with exactly: "
+         "'⚠️ This information is not available in the uploaded PDF.' "
+         "Never use outside knowledge. Never guess. Keep answers concise.\n\n"
+         "Context:\n{context}"),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+    return rag_chain
+
+# ── Session History Helper ────────────────────────────────────────────────────
+def get_session_history(session: str) -> BaseChatMessageHistory:
+    if session not in st.session_state.store:
+        st.session_state.store[session] = ChatMessageHistory()
+    return st.session_state.store[session]
+
+SESSION_ID = "user_session"
+
+# ── Main Chat Area ────────────────────────────────────────────────────────────
+if st.session_state.vectorstore is None:
+    st.info("👈 Upload a PDF from the sidebar to get started.")
+else:
+    # Render previous messages
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+    user_input = st.chat_input("Ask a question about your PDF…")
+
+    if user_input:
+        # Show user message
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.write(user_input)
+
+        # Build chain and get answer
+        rag_chain = build_chain(st.session_state.vectorstore)
+        conversational_rag_chain = RunnableWithMessageHistory(
+            rag_chain,
+            get_session_history,
+            input_message_key="input",
+            history_messages_key="chat_history",
+            output_messages_key="answer"
+        )
+
+        with st.chat_message("assistant"):
+            with st.spinner("Searching your PDF…"):
+                response = conversational_rag_chain.invoke(
+                    {"input": user_input},
+                    config={"configurable": {"session_id": SESSION_ID}},
+                )
+            answer = response["answer"]
+            st.write(answer)
+
+        st.session_state.messages.append({"role": "assistant", "content": answer})
