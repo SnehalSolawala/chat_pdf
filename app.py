@@ -1,31 +1,28 @@
 ## RAG Q&A — User uploads their own PDF and chats with it
 ## Uses OpenAI for both LLM (gpt-4o-mini) and Embeddings (text-embedding-3-small)
 
-# ── SQLite fix for Render / Streamlit Cloud (must be before any other import) ─
 import sys
 if sys.platform.startswith("linux"):
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
 import streamlit as st
 import os
 import tempfile
-
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
-
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API Keys (works both locally via .env AND on Render/Streamlit Cloud via env vars)
+# ── API Keys ──────────────────────────────────────────────────────────────────
 def get_secret(key: str) -> str:
     try:
         return st.secrets[key]          # Streamlit Cloud
@@ -40,23 +37,23 @@ st.set_page_config(page_title="PDF Q&A Chatbot", page_icon="📄")
 st.title("📄 Chat with your PDF")
 st.caption("Upload a PDF and ask questions. Answers come strictly from your document.")
 
-# ── Load Embeddings once ───────────────────────────────────────────────────────
+# ── Load Embeddings once ──────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading embedding model…")
 def load_embeddings():
     return OpenAIEmbeddings(
-        model="text-embedding-3-small",  # cheap & fast; upgrade to text-embedding-3-large if needed
+        model="text-embedding-3-small",
         openai_api_key=OPENAI_API_KEY
     )
 
 embeddings = load_embeddings()
 
-# ── Load LLM once ─────────────────────────────────────────────────────────────
+# ── Load LLM once ────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_llm():
     return ChatOpenAI(
-        model="gpt-4o-mini",            # cost-effective; swap to "gpt-4o" for higher quality
+        model="gpt-4o-mini",
         openai_api_key=OPENAI_API_KEY,
-        temperature=0                   # 0 = no creativity, strictly factual
+        temperature=0
     )
 
 llm = load_llm()
@@ -80,7 +77,6 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
 
     if uploaded_file:
-        # Re-index only when a NEW file is uploaded
         if uploaded_file.name != st.session_state.last_uploaded_file:
             with st.spinner("Reading and indexing your PDF…"):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -175,22 +171,18 @@ else:
             st.write(user_input)
 
         rag_chain = build_chain(st.session_state.vectorstore)
-
-        conversational_rag_chain = RunnableWithMessageHistory(
-            rag_chain,
-            get_session_history,
-            input_message_key="input",
-            history_messages_key="chat_history",
-            output_messages_key="answer"
-        )
+        history = get_session_history(SESSION_ID)
 
         with st.chat_message("assistant"):
             with st.spinner("Searching your PDF…"):
-                response = conversational_rag_chain.invoke(
-                    {"input": user_input},
-                    config={"configurable": {"session_id": SESSION_ID}},
-                )
+                response = rag_chain.invoke({
+                    "input": user_input,
+                    "chat_history": history.messages
+                })
             answer = response["answer"]
             st.write(answer)
+
+        history.add_user_message(user_input)
+        history.add_ai_message(answer)
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
