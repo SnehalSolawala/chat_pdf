@@ -1,32 +1,39 @@
 ## RAG Q&A — User uploads their own PDF and chats with it
+## Uses OpenAI for both LLM (gpt-4o-mini) and Embeddings (text-embedding-3-small)
 
+# ── SQLite fix for Render / Streamlit Cloud (must be before any other import) ─
+import sys
+if sys.platform.startswith("linux"):
+    __import__('pysqlite3')
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 import streamlit as st
 import os
 import tempfile
+
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
+
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API Keys (works both locally via .env AND on Streamlit Cloud via st.secrets)
+# ── API Keys (works both locally via .env AND on Render/Streamlit Cloud via env vars)
 def get_secret(key: str) -> str:
     try:
         return st.secrets[key]          # Streamlit Cloud
     except Exception:
-        return os.getenv(key, "")       # Local .env
+        return os.getenv(key, "")       # Local .env / Render env vars
 
-GROQ_API_KEY = get_secret("GROQ_API_KEY")
-os.environ["HF_TOKEN"] = get_secret("HF_TOKEN")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF Q&A Chatbot", page_icon="📄")
@@ -36,9 +43,9 @@ st.caption("Upload a PDF and ask questions. Answers come strictly from your docu
 # ── Load Embeddings once ───────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading embedding model…")
 def load_embeddings():
-    return HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"}
+    return OpenAIEmbeddings(
+        model="text-embedding-3-small",  # cheap & fast; upgrade to text-embedding-3-large if needed
+        openai_api_key=OPENAI_API_KEY
     )
 
 embeddings = load_embeddings()
@@ -46,10 +53,10 @@ embeddings = load_embeddings()
 # ── Load LLM once ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_llm():
-    return ChatGroq(
-        model_name="llama-3.1-8b-instant",
-        groq_api_key=GROQ_API_KEY,
-        temperature=0           # 0 = no creativity, strictly factual
+    return ChatOpenAI(
+        model="gpt-4o-mini",            # cost-effective; swap to "gpt-4o" for higher quality
+        openai_api_key=OPENAI_API_KEY,
+        temperature=0                   # 0 = no creativity, strictly factual
     )
 
 llm = load_llm()
