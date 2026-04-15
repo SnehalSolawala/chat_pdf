@@ -8,3 +8,4 @@ langchain-openai==0.3.16
 
 chromadb
 pypdf
+pysqlite3-binary
